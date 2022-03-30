@@ -70,6 +70,7 @@ enum
 #define DEFAULT_SINGLE_SEGMENT          FALSE
 #define DEFAULT_DUMP                    FALSE
 #define DEFAULT_SYNC                    FALSE
+#define DEFAULT_DELAY_ON_START          FALSE
 #define DEFAULT_CHECK_IMPERFECT_TIMESTAMP FALSE
 #define DEFAULT_CHECK_IMPERFECT_OFFSET    FALSE
 #define DEFAULT_SIGNAL_HANDOFFS           TRUE
@@ -95,7 +96,8 @@ enum
   PROP_CHECK_IMPERFECT_OFFSET,
   PROP_SIGNAL_HANDOFFS,
   PROP_DROP_ALLOCATION,
-  PROP_EOS_AFTER
+  PROP_EOS_AFTER,
+  PROP_DELAY_ON_START
 };
 
 
@@ -204,6 +206,10 @@ gst_identity_class_init (GstIdentityClass * klass)
       g_param_spec_boolean ("sync", "Synchronize",
           "Synchronize to pipeline clock", DEFAULT_SYNC,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_DELAY_ON_START,
+      g_param_spec_boolean ("delay-on-start", "DELAY_ON_START",
+          "DELAY_ON_START", DEFAULT_DELAY_ON_START,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_TS_OFFSET,
       g_param_spec_int64 ("ts-offset", "Timestamp offset for synchronisation",
           "Timestamp offset in nanoseconds for synchronisation, negative for earlier sync",
@@ -299,6 +305,7 @@ gst_identity_init (GstIdentity * identity)
   identity->silent = DEFAULT_SILENT;
   identity->single_segment = DEFAULT_SINGLE_SEGMENT;
   identity->sync = DEFAULT_SYNC;
+  identity->delay_on_start = DEFAULT_DELAY_ON_START;
   identity->check_imperfect_timestamp = DEFAULT_CHECK_IMPERFECT_TIMESTAMP;
   identity->check_imperfect_offset = DEFAULT_CHECK_IMPERFECT_OFFSET;
   identity->dump = DEFAULT_DUMP;
@@ -308,6 +315,7 @@ gst_identity_init (GstIdentity * identity)
   g_cond_init (&identity->blocked_cond);
   identity->eos_after = DEFAULT_EOS_AFTER;
   identity->eos_after_counter = DEFAULT_EOS_AFTER;
+  identity->first_buffer_receive_time = GST_CLOCK_TIME_NONE;
 
   gst_base_transform_set_gap_aware (GST_BASE_TRANSFORM_CAST (identity), TRUE);
 }
@@ -713,6 +721,46 @@ gst_identity_transform_ip (GstBaseTransform * trans, GstBuffer * buf)
     GST_BUFFER_OFFSET_END (buf) = GST_CLOCK_TIME_NONE;
   }
 
+  GstClock *clock;
+  GST_DEBUG_OBJECT(identity, "PTS of buffer is: %"GST_TIME_FORMAT,GST_TIME_ARGS(GST_BUFFER_PTS(buf)));
+  if (clock = gst_element_get_clock(GST_ELEMENT_CAST (identity))){
+    GST_DEBUG_OBJECT(identity, "Clock is available");
+    GstClockTime now = gst_clock_get_internal_time(clock);
+    GST_DEBUG_OBJECT(identity, "Time now is: %"GST_TIME_FORMAT,GST_TIME_ARGS(now));
+    if (!GST_CLOCK_TIME_IS_VALID(identity->first_buffer_receive_time)) {
+      if (identity->delay_on_start) {
+        GST_DEBUG_OBJECT(identity, "Received first buffer since we entered playing state. Setting first buffer time to now^+ 2 seconds");
+        identity->first_buffer_receive_time = now+2000000000;
+      } else {
+        GST_DEBUG_OBJECT(identity, "Received first buffer since we entered playing state. Setting first buffer time to now^");
+        identity->first_buffer_receive_time = now;
+
+      }
+    }
+
+    GstClockTime wait = identity->first_buffer_receive_time+GST_BUFFER_PTS(buf);
+    if (!identity->delay_on_start) {
+      wait-=3600000000000000;
+    }
+    
+    GST_DEBUG_OBJECT(identity, "Waiting till PTS + first_buffer_receive_time which is: %"GST_TIME_FORMAT,GST_TIME_ARGS(wait));
+    GstClockID clock_id = gst_clock_new_single_shot_id (clock, wait);
+    if (!clock_id) {
+      GST_DEBUG_OBJECT(identity, "clock_id was null, not waiting");
+      return ret;
+    }
+    GST_DEBUG_OBJECT(identity, "Start waiting");
+    GstClockReturn cret = gst_clock_id_wait (clock_id, NULL);
+    GST_DEBUG_OBJECT(identity, "Stop waiting");
+
+    if (cret == GST_CLOCK_UNSCHEDULED || identity->flushing)
+        ret = GST_FLOW_FLUSHING;
+
+
+  }
+
+
+
   return ret;
 
   /* ERRORS */
@@ -782,6 +830,9 @@ gst_identity_set_property (GObject * object, guint prop_id,
     case PROP_SYNC:
       identity->sync = g_value_get_boolean (value);
       break;
+    case PROP_DELAY_ON_START:
+      identity->delay_on_start = g_value_get_boolean (value);
+      break;
     case PROP_TS_OFFSET:
       identity->ts_offset = g_value_get_int64 (value);
       break;
@@ -850,6 +901,9 @@ gst_identity_get_property (GObject * object, guint prop_id, GValue * value,
       break;
     case PROP_SYNC:
       g_value_set_boolean (value, identity->sync);
+      break;
+    case PROP_DELAY_ON_START:
+      g_value_set_boolean (value, identity->delay_on_start);
       break;
     case PROP_TS_OFFSET:
       g_value_set_int64 (value, identity->ts_offset);
@@ -999,8 +1053,10 @@ gst_identity_change_state (GstElement * element, GstStateChange transition)
 
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
+      GST_DEBUG_OBJECT(identity, "Moved to Ready");
       break;
     case GST_STATE_CHANGE_READY_TO_PAUSED:
+      GST_DEBUG_OBJECT(identity, "Moved to Paused");
       GST_OBJECT_LOCK (identity);
       identity->flushing = FALSE;
       identity->blocked = TRUE;
@@ -1009,6 +1065,7 @@ gst_identity_change_state (GstElement * element, GstStateChange transition)
         no_preroll = TRUE;
       break;
     case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+      GST_DEBUG_OBJECT(identity, "Moved to Playing");
       GST_OBJECT_LOCK (identity);
       identity->blocked = FALSE;
       g_cond_broadcast (&identity->blocked_cond);

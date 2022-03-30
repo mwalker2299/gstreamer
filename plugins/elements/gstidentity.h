@@ -64,6 +64,7 @@ struct _GstIdentity {
   gboolean 	 silent;
   gboolean 	 dump;
   gboolean 	 sync;
+  gboolean delay_on_start;
   gboolean 	 check_imperfect_timestamp;
   gboolean 	 check_imperfect_offset;
   gboolean	 single_segment;
@@ -76,6 +77,7 @@ struct _GstIdentity {
   guint64        offset;
   gboolean       signal_handoffs;
   GstClockTime   upstream_latency;
+  GstClockTime   first_buffer_receive_time;
   GCond          blocked_cond;
   gboolean       blocked;
   GstClockTimeDiff  ts_offset;
